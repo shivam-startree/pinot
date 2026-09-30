@@ -39,6 +39,8 @@ import org.apache.pinot.query.mailbox.MailboxService;
 import org.apache.pinot.query.mailbox.ReceivingMailbox;
 import org.apache.pinot.query.planner.physical.MailboxIdUtils;
 import org.apache.pinot.query.planner.plannode.MailboxReceiveNode;
+import org.apache.pinot.query.planner.plannode.PlanNode;
+import org.apache.pinot.query.planner.plannode.SortNode;
 import org.apache.pinot.query.routing.MailboxInfo;
 import org.apache.pinot.query.routing.MailboxInfos;
 import org.apache.pinot.query.routing.SharedMailboxInfos;
@@ -115,6 +117,56 @@ public class SortedMailboxMergeReceiveOperatorTest {
   public void tearDownMethod()
       throws Exception {
     _mocks.close();
+  }
+
+  @Test
+  public void shouldStreamLimitOverMatchingMergeBeforeSenderEos() {
+    when(_mailboxService.getReceivingMailbox(eq(MAILBOX_ID_1))).thenReturn(_mailbox1);
+    when(_mailbox1.poll()).thenReturn(
+        OperatorTestUtil.sortedBlockWithStats(DATA_SCHEMA, new Object[]{1, 1}),
+        OperatorTestUtil.sortedBlockWithStats(DATA_SCHEMA, new Object[]{2, 1}),
+        OperatorTestUtil.sortedBlockWithStats(DATA_SCHEMA, new Object[]{3, 1}),
+        OperatorTestUtil.eosWithEmptyStats());
+    try (SortedMailboxMergeReceiveOperator receive = getOperator(_stageMetadata1, RelDistribution.Type.SINGLETON)) {
+      SortOperator sort = SortOperator.create(OperatorTestUtil.getTracingContext(), receive,
+          new SortNode(0, DATA_SCHEMA, PlanNode.NodeHint.EMPTY, List.of(), FIELD_COLLATIONS, 1, 1));
+      assertTrue(sort instanceof LimitSortOperator);
+      assertEquals(((MseBlock.Data) sort.nextBlock()).asRowHeap().getRows().get(0), new Object[]{2, 1});
+      verify(_mailbox1, times(2)).poll();
+      verify(_mailbox1).earlyTerminate();
+      assertTrue(sort.nextBlock().isSuccess());
+    }
+  }
+
+  @Test
+  public void shouldRejectConfirmedSenderDisorderAcrossBlocks() {
+    when(_mailboxService.getReceivingMailbox(eq(MAILBOX_ID_1))).thenReturn(_mailbox1);
+    when(_mailbox1.poll()).thenReturn(
+        OperatorTestUtil.sortedBlockWithStats(DATA_SCHEMA, new Object[]{2, 1}),
+        OperatorTestUtil.sortedBlockWithStats(DATA_SCHEMA, new Object[]{1, 1}),
+        OperatorTestUtil.eosWithEmptyStats());
+    try (SortedMailboxMergeReceiveOperator receive = getOperator(_stageMetadata1, RelDistribution.Type.SINGLETON)) {
+      assertTrue(receive.nextBlock().isData());
+      MseBlock block = receive.nextBlock();
+      assertTrue(block.isError());
+      assertTrue(((ErrorMseBlock) block).getErrorMessages().get(QueryErrorCode.INTERNAL).contains("out-of-order"));
+    }
+  }
+
+  @Test
+  public void shouldRejectConfirmedSenderDisorderWithinMergedBlock() {
+    when(_mailboxService.getReceivingMailbox(eq(MAILBOX_ID_1))).thenReturn(_mailbox1);
+    when(_mailbox1.poll()).thenReturn(
+        OperatorTestUtil.sortedBlockWithStats(DATA_SCHEMA, new Object[]{2, 1}, new Object[]{1, 1}),
+        OperatorTestUtil.eosWithEmptyStats());
+    when(_mailboxService.getReceivingMailbox(eq(MAILBOX_ID_2))).thenReturn(_mailbox2);
+    when(_mailbox2.poll()).thenReturn(
+        OperatorTestUtil.sortedBlockWithStats(DATA_SCHEMA, new Object[]{3, 1}),
+        OperatorTestUtil.eosWithEmptyStats());
+    try (SortedMailboxMergeReceiveOperator receive = getOperator(_stageMetadataBoth,
+        RelDistribution.Type.HASH_DISTRIBUTED)) {
+      assertTrue(receive.nextBlock().isError());
+    }
   }
 
   @Test

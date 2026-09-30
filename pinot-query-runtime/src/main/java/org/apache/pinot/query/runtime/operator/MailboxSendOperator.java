@@ -52,9 +52,8 @@ import org.slf4j.LoggerFactory;
 /// This `MailboxSendOperator` is created to send [MseBlock]s to the receiving end.
 ///
 /// This operator preserves the order produced by its input and does not establish ordering itself. When a mailbox
-/// receive performs a k-way merge, the planner places a [SortOperator] in this operator's input op-chain. The
-/// mailbox transport only confirms that structural guarantee so a mixed-version receiver can safely fall back when
-/// an older sender does not keep the sort above its leaf boundary.
+/// receive performs a k-way merge, the input must prove its output ordering on the exchange collation. The transport
+/// confirms that guarantee so a mixed-version receiver can safely fall back when an older sender does not provide it.
 public class MailboxSendOperator extends MultiStageOperator {
   public static final EnumSet<RelDistribution.Type> SUPPORTED_EXCHANGE_TYPES =
       EnumSet.of(RelDistribution.Type.SINGLETON, RelDistribution.Type.RANDOM_DISTRIBUTED,
@@ -75,7 +74,7 @@ public class MailboxSendOperator extends MultiStageOperator {
 
   @VisibleForTesting
   static boolean isSortedOnSender(MultiStageOperator input, MailboxSendNode node) {
-    return input instanceof SortOperator && node.hasExplicitSortInput();
+    return node.isSort() && !node.getCollations().isEmpty() && input.isSortedOn(node.getCollations());
   }
 
   @VisibleForTesting

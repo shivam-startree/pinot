@@ -25,8 +25,10 @@ import it.unimi.dsi.fastutil.ints.IntList;
 import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import java.util.List;
+import javax.annotation.Nullable;
 import org.apache.calcite.rel.RelDistribution;
 import org.apache.pinot.calcite.rel.logical.PinotRelExchangeType;
+import org.apache.pinot.common.config.provider.TableCache;
 import org.apache.pinot.query.planner.PlanFragment;
 import org.apache.pinot.query.planner.plannode.AggregateNode;
 import org.apache.pinot.query.planner.plannode.EnrichedJoinNode;
@@ -45,6 +47,8 @@ import org.apache.pinot.query.planner.plannode.TableScanNode;
 import org.apache.pinot.query.planner.plannode.UnnestNode;
 import org.apache.pinot.query.planner.plannode.ValueNode;
 import org.apache.pinot.query.planner.plannode.WindowNode;
+import org.apache.pinot.spi.config.table.TableType;
+import org.apache.pinot.spi.utils.builder.TableNameBuilder;
 
 
 /// PlanFragmenter is an implementation of [PlanNodeVisitor] to fragment a
@@ -67,6 +71,18 @@ public class PlanFragmenter implements PlanNodeVisitor<PlanNode, PlanFragmenter.
 
   // ROOT PlanFragment ID is 0, current PlanFragment ID starts with 1, next PlanFragment ID starts with 2.
   private int _nextPlanFragmentId = 2;
+  private final boolean _streamingSortedMailboxReceiveEnabled;
+  @Nullable
+  private final TableCache _tableCache;
+
+  public PlanFragmenter() {
+    this(false, null);
+  }
+
+  public PlanFragmenter(boolean streamingSortedMailboxReceiveEnabled, @Nullable TableCache tableCache) {
+    _streamingSortedMailboxReceiveEnabled = streamingSortedMailboxReceiveEnabled;
+    _tableCache = tableCache;
+  }
 
   public Context createContext() {
     // ROOT PlanFragment ID is 0, current PlanFragment ID starts with 1.
@@ -186,9 +202,14 @@ public class PlanFragmenter implements PlanNodeVisitor<PlanNode, PlanFragmenter.
 
     // Create a new context for the next PlanFragment with MailboxSendNode as the root node.
     PlanNode nextPlanFragmentRoot = node.getInputs().get(0).visit(this, new Context(senderPlanFragmentId));
-    Preconditions.checkState(!node.isSortOnSender() || node.isSortOnReceiver(),
+    boolean orderedLeaf = _streamingSortedMailboxReceiveEnabled && isSinglePhysicalLeafSort(nextPlanFragmentRoot)
+        && ((SortNode) nextPlanFragmentRoot).getCollations().equals(node.getCollations());
+    boolean sortedOnSender = node.isSortOnSender() || orderedLeaf;
+    boolean sortOnReceiver = node.isSortOnReceiver() || orderedLeaf;
+    Preconditions.checkState(!sortedOnSender || sortOnReceiver,
         "Sender sorting requires the receiver merge-sort contract");
-    if (node.isSortOnSender()) {
+    if (sortedOnSender && !(nextPlanFragmentRoot instanceof SortNode
+        && ((SortNode) nextPlanFragmentRoot).getCollations().equals(node.getCollations()))) {
       Preconditions.checkState(!node.getCollations().isEmpty(),
           "Sender sorting requires a non-empty exchange collation");
       // Ordering belongs to an explicit operator in the sender fragment. MailboxSendOperator only preserves and
@@ -204,7 +225,7 @@ public class PlanFragmenter implements PlanNodeVisitor<PlanNode, PlanFragmenter.
     MailboxSendNode mailboxSendNode =
         new MailboxSendNode(senderPlanFragmentId, nextPlanFragmentRoot.getDataSchema(), List.of(nextPlanFragmentRoot),
             receiverPlanFragmentId, exchangeType, distributionType, keys, node.isPrePartitioned(), node.getCollations(),
-            node.isSortOnSender(), node.getHashFunction());
+            sortedOnSender, node.getHashFunction());
     _planFragmentMap.put(senderPlanFragmentId,
         new PlanFragment(senderPlanFragmentId, mailboxSendNode, new ArrayList<>()));
     _mailboxSendToExchangeNodeMap.put(mailboxSendNode, node);
@@ -212,8 +233,8 @@ public class PlanFragmenter implements PlanNodeVisitor<PlanNode, PlanFragmenter.
     // Return the MailboxReceiveNode as the leave node of the current PlanFragment.
     MailboxReceiveNode mailboxReceiveNode =
         new MailboxReceiveNode(receiverPlanFragmentId, nextPlanFragmentRoot.getDataSchema(),
-            senderPlanFragmentId, exchangeType, distributionType, keys, node.getCollations(), node.isSortOnReceiver(),
-            node.isSortOnSender(), mailboxSendNode);
+            senderPlanFragmentId, exchangeType, distributionType, keys, node.getCollations(), sortOnReceiver,
+            sortedOnSender, mailboxSendNode);
     _mailboxReceiveToExchangeNodeMap.put(mailboxReceiveNode, node);
     return mailboxReceiveNode;
   }
@@ -234,6 +255,31 @@ public class PlanFragmenter implements PlanNodeVisitor<PlanNode, PlanFragmenter.
 
   public IdentityHashMap<MailboxReceiveNode, ExchangeNode> getMailboxReceiveToExchangeNodeMap() {
     return _mailboxReceiveToExchangeNodeMap;
+  }
+
+  private boolean isSinglePhysicalLeafSort(PlanNode node) {
+    if (!(node instanceof SortNode) || !((SortNode) node).isLeafSelectionSort() || _tableCache == null) {
+      return false;
+    }
+    while (!(node instanceof TableScanNode)) {
+      node = node.getInputs().get(0);
+    }
+    String tableName = ((TableScanNode) node).getTableName();
+    if (TableNameBuilder.getTableTypeFromTableName(tableName) != null) {
+      return true;
+    }
+    String actualTableName = _tableCache.getActualTableName(tableName);
+    if (actualTableName == null || _tableCache.isLogicalTable(actualTableName)) {
+      return false;
+    }
+    if (TableNameBuilder.getTableTypeFromTableName(actualTableName) != null) {
+      return true;
+    }
+    boolean offline = _tableCache.getTableConfig(TableNameBuilder.forType(TableType.OFFLINE)
+        .tableNameWithType(actualTableName)) != null;
+    boolean realtime = _tableCache.getTableConfig(TableNameBuilder.forType(TableType.REALTIME)
+        .tableNameWithType(actualTableName)) != null;
+    return offline != realtime;
   }
 
   private boolean isPlanFragmentSplitter(PlanNode node) {

@@ -31,6 +31,7 @@ import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Set;
 import javax.annotation.Nullable;
+import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.commons.collections4.CollectionUtils;
 import org.apache.pinot.common.utils.DataSchema;
 import org.apache.pinot.query.mailbox.ReceivingMailbox;
@@ -49,8 +50,8 @@ import org.slf4j.LoggerFactory;
 
 /// Receives streams that the plan declares sorted on the sender and merges them by the exchange collation.
 ///
-/// An explicit sender [SortOperator] establishes the row ordering; [MailboxSendOperator] only transports that
-/// ordering. The transport marker confirms rollout compatibility and is not itself a sorting mechanism.
+/// The sender operator establishes the row ordering; [MailboxSendOperator] only transports that ordering. The
+/// transport marker confirms rollout compatibility and is not itself a sorting mechanism.
 ///
 /// The plan declaration alone is not trusted during a rolling upgrade. Every data block must carry the transport's
 /// sender-sort confirmation. Before this operator emits its first row it obtains a head row, or EOS, from every live
@@ -72,6 +73,9 @@ public class SortedMailboxMergeReceiveOperator extends BaseMailboxReceiveOperato
   private static final String EXPLAIN_NAME = "SORTED_MAILBOX_MERGE_RECEIVE";
   private static final String MERGE_SCOPE = "SortedMailboxMergeReceiveOperator";
   private final DataSchema _dataSchema;
+  private final List<RelFieldCollation> _collations;
+  @Nullable
+  private Object[] _lastEmittedRow;
   private final Comparator<Object[]> _comparator;
   private final PriorityQueue<SenderCursor> _readyCursors;
   private final boolean _singleSortedSender;
@@ -98,7 +102,8 @@ public class SortedMailboxMergeReceiveOperator extends BaseMailboxReceiveOperato
     Preconditions.checkState(node.isSortedOnSender(), "Sender-side sorting must be enabled");
     Preconditions.checkState(!CollectionUtils.isEmpty(node.getCollations()), "Field collations must be set");
     _dataSchema = node.getDataSchema();
-    _comparator = new SortUtils.SortComparator(List.copyOf(node.getCollations()), false);
+    _collations = List.copyOf(node.getCollations());
+    _comparator = new SortUtils.SortComparator(_collations, false);
     List<AsyncStream<ReceivingMailbox.MseBlockWithStats>> streams = _multiConsumer.getLiveStreamsSnapshot();
     _readyCursors = new PriorityQueue<>(Math.max(streams.size(), 1),
         (left, right) -> _comparator.compare(left.peek(), right.peek()));
@@ -133,7 +138,24 @@ public class SortedMailboxMergeReceiveOperator extends BaseMailboxReceiveOperato
     if (_isEarlyTerminated) {
       return readUntilEos();
     }
-    return _singleSortedSender ? readSingleSortedSender() : mergeNextBlock();
+    MseBlock block = _singleSortedSender ? readSingleSortedSender() : mergeNextBlock();
+    if (block.isData()) {
+      // Check every merge path, including the single-sender pass-through and optimized equal/four-sender batches.
+      // A sender that falsely confirms ordering must fail rather than silently return incorrect LIMIT/join rows.
+      for (Object[] row : ((MseBlock.Data) block).asRowHeap().getRows()) {
+        if (_lastEmittedRow != null && _comparator.compare(_lastEmittedRow, row) > 0) {
+          throw QueryErrorCode.INTERNAL.asException("Sorted mailbox receive got out-of-order rows on stage "
+              + _context.getStageId());
+        }
+        _lastEmittedRow = row;
+      }
+    }
+    return block;
+  }
+
+  @Override
+  public boolean isSortedOn(List<RelFieldCollation> collations) {
+    return !collations.isEmpty() && _collations.equals(collations);
   }
 
   /// Passes through one confirmed sorted sender without copying its rows through the merge heap.
@@ -341,13 +363,15 @@ public class SortedMailboxMergeReceiveOperator extends BaseMailboxReceiveOperato
 
   @Override
   protected void releaseBuffers() {
+    _lastEmittedRow = null;
     _rows = null;
     releaseCursors();
   }
 
   @Override
   protected boolean hasBufferedState() {
-    return _rows != null || !_cursorsByStream.isEmpty() || !_readyCursors.isEmpty() || !_starvedCursors.isEmpty();
+    return _lastEmittedRow != null || _rows != null || !_cursorsByStream.isEmpty() || !_readyCursors.isEmpty()
+        || !_starvedCursors.isEmpty();
   }
 
   private void releaseCursors() {

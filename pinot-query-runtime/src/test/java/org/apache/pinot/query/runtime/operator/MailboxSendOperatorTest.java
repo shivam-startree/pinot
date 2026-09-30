@@ -25,6 +25,7 @@ import java.io.DataOutputStream;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.pinot.common.datatable.StatMap;
 import org.apache.pinot.common.utils.DataSchema;
 import org.apache.pinot.common.utils.DataSchema.ColumnDataType;
@@ -166,15 +167,19 @@ public class MailboxSendOperatorTest {
   }
 
   @Test
-  public void shouldConfirmSenderSortingOnlyForExplicitRuntimeSort() {
+  public void shouldConfirmOnlyMatchingProducerOrdering() {
     MailboxSendNode sendNode = mock(MailboxSendNode.class);
-    when(sendNode.hasExplicitSortInput()).thenReturn(true);
-
-    assertTrue(MailboxSendOperator.isSortedOnSender(mock(SortOperator.class), sendNode));
+    List<RelFieldCollation> collations = List.of(new RelFieldCollation(0));
+    when(sendNode.isSort()).thenReturn(true);
+    when(sendNode.getCollations()).thenReturn(collations);
     assertFalse(MailboxSendOperator.isSortedOnSender(_input, sendNode));
-
-    when(sendNode.hasExplicitSortInput()).thenReturn(false);
-    assertFalse(MailboxSendOperator.isSortedOnSender(mock(SortOperator.class), sendNode));
+    when(_input.isSortedOn(collations)).thenReturn(true);
+    assertTrue(MailboxSendOperator.isSortedOnSender(_input, sendNode));
+    when(sendNode.getCollations()).thenReturn(List.of(new RelFieldCollation(1)));
+    assertFalse(MailboxSendOperator.isSortedOnSender(_input, sendNode));
+    when(sendNode.getCollations()).thenReturn(collations);
+    when(sendNode.isSort()).thenReturn(false);
+    assertFalse(MailboxSendOperator.isSortedOnSender(_input, sendNode));
   }
 
   @Test

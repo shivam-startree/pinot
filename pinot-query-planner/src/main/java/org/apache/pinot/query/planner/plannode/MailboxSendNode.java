@@ -161,8 +161,8 @@ public class MailboxSendNode extends BasePlanNode {
   /// Returns whether this node's input explicitly establishes the ordering advertised to the receiver.
   ///
   /// The sort flag alone is only plan metadata; the runtime send operator does not sort. Requiring a matching
-  /// [SortNode] directly below the send node gives both leaf-boundary planning and mailbox transport one structural
-  /// definition of a sorted sender.
+  /// [SortNode] directly below the send node lets leaf-boundary planning retain sorting above multiple V1 requests.
+  /// Mailbox transport independently checks the runtime producer's output ordering.
   public boolean hasExplicitSortInput() {
     if (!_sort || _collations.isEmpty() || _inputs.size() != 1 || !(_inputs.get(0) instanceof SortNode)) {
       return false;
