@@ -140,9 +140,12 @@ public class SortedMailboxMergeReceiveOperator extends BaseMailboxReceiveOperato
     }
     MseBlock block = _singleSortedSender ? readSingleSortedSender() : mergeNextBlock();
     if (block.isData()) {
-      // Check every merge path, including the single-sender pass-through and optimized equal/four-sender batches.
+      // Check every merge path, including the single-sender pass-through.
       // A sender that falsely confirms ordering must fail rather than silently return incorrect LIMIT/join rows.
+      int numValidatedRows = 0;
       for (Object[] row : ((MseBlock.Data) block).asRowHeap().getRows()) {
+        QueryThreadContext.checkTerminationAndSampleUsagePeriodically(++numValidatedRows, MERGE_SCOPE,
+            _context.getActiveDeadlineMs());
         if (_lastEmittedRow != null && _comparator.compare(_lastEmittedRow, row) > 0) {
           throw QueryErrorCode.INTERNAL.asException("Sorted mailbox receive got out-of-order rows on stage "
               + _context.getStageId());
